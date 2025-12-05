@@ -11,10 +11,19 @@ export default () => {
 
   return defineConfig({
     plugins: [vue(), vuetify({ autoImport: true })],
-
+    
     server: {
       host: "localhost",
       port: 8081,
+      proxy: {
+        // Proxy API requests to backend to avoid CORS issues
+        "/booklistapi": {
+          target: "http://localhost:3201",
+          changeOrigin: true,
+          secure: false,
+          rewrite: (path) => path, // Keep the /booklistapi prefix
+        },
+      },
     },
     base: baseURL,
   });

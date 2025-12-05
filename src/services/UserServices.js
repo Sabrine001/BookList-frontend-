@@ -5,20 +5,27 @@ export default {
     return apiClient.get("users");
   },
   addUser(user) {
-    return apiClient.post("users", user);
+    // Backend expects: first_name, email, password (snake_case)
+    // Accept either a ref (with .value) or a plain object
+    const u = user?.value ?? user;
+    // Transform camelCase to snake_case for backend
+    const userData = {
+      first_name: u.firstName || u.first_name,
+      email: u.email,
+      password: u.password,
+    };
+    return apiClient.post("users/register", userData);
   },
   loginUser(user) {
-    console.log(user);
-    return apiClient.post("login", user.value, {
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "X-Requested-With": "XMLHttpRequest",
-        crossDomain: true,
-        Authorization:
-          "Basic " + btoa(user.value.email + ":" + user.value.password),
-      },
-    });
+    // Backend expects: email, password
+    // Accept either a ref (with .value) or a plain object
+    const u = user?.value ?? user;
+    // Only send email and password for login
+    const loginData = {
+      email: u.email,
+      password: u.password,
+    };
+    return apiClient.post("users/login", loginData);
   },
   logoutUser() {
     return apiClient.post("logout");
