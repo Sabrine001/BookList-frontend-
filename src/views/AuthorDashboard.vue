@@ -14,8 +14,10 @@ const myBooks = ref([]);
 const reviews = ref([]);
 const loading = ref(false);
 const showEditProfile = ref(false);
+const showCreateProfile = ref(false);
 const showEditBook = ref(false);
 const editingBook = ref(null);
+const profileNotFound = ref(false);
 
 const profileForm = ref({
   bio: "",
@@ -57,8 +59,7 @@ onMounted(async () => {
   }
 
   await loadAuthorProfile();
-  await loadMyBooks();
-  await loadReviews();
+  // loadMyBooks() and loadReviews() are called from loadAuthorProfile() if profile exists
 });
 
 async function loadAuthorProfile() {
@@ -66,16 +67,68 @@ async function loadAuthorProfile() {
   try {
     const response = await AuthorServices.getMyAuthorProfile();
     authorProfile.value = response.data;
+    profileNotFound.value = false;
     if (authorProfile.value) {
       profileForm.value = {
         bio: authorProfile.value.bio || "",
         website: authorProfile.value.website || "",
         social_links: authorProfile.value.social_links || {},
       };
+      // Load books and reviews after profile is loaded
+      await Promise.all([loadMyBooks(), loadReviews()]);
+    } else {
+      // Profile exists but is null/undefined
+      profileNotFound.value = true;
+      authorProfile.value = null;
     }
   } catch (error) {
     console.error("Error loading author profile:", error);
-    showSnackbar("Failed to load author profile", "error");
+    console.error("Full error details:", {
+      message: error.message,
+      response: error.response?.data,
+      status: error.response?.status,
+      statusText: error.response?.statusText,
+      url: error.config?.url,
+      baseURL: error.config?.baseURL,
+      fullURL: error.config?.baseURL + error.config?.url,
+      code: error.code,
+    });
+    
+    // If 404 or "not found" message, user doesn't have an author profile yet
+    const isNotFound = error.response?.status === 404 || 
+                      error.message?.toLowerCase().includes("not found") ||
+                      error.response?.data?.message?.toLowerCase().includes("not found");
+    
+    if (isNotFound) {
+      // This is normal - user just needs to create a profile
+      profileNotFound.value = true;
+      authorProfile.value = null;
+      
+      // Initialize profile form with user's name
+      const userName = currentUser.value?.firstName || 
+                       currentUser.value?.first_name || 
+                       currentUser.value?.name || 
+                       currentUser.value?.user?.first_name || 
+                       "";
+      profileForm.value = {
+        name: userName,
+        bio: "",
+        website: "",
+        social_links: {},
+      };
+      
+      // Don't show error for 404 - it's expected if no profile exists
+      console.log("No author profile found - user can create one");
+    } else {
+      // Real error (network, server error, etc.)
+      const errorMsg = error.response?.data?.message || error.message || "Failed to load author profile";
+      showSnackbar(
+        errorMsg + ". If you have an author profile, please contact support.",
+        "error"
+      );
+      authorProfile.value = null;
+      profileNotFound.value = true;
+    }
   } finally {
     loading.value = false;
   }
@@ -83,11 +136,95 @@ async function loadAuthorProfile() {
 
 async function loadMyBooks() {
   try {
-    if (!authorProfile.value?.id) return;
-    const response = await AuthorServices.getAuthorBooks(authorProfile.value.id);
-    myBooks.value = response.data || [];
+    // If author profile exists, load books by author ID
+    if (authorProfile.value?.id) {
+      console.log("Loading books for author ID:", authorProfile.value.id);
+      
+      try {
+        // First try the /authors/me/books endpoint (if it exists)
+        const myBooksResponse = await AuthorServices.getMyBooks();
+        myBooks.value = Array.isArray(myBooksResponse.data) 
+          ? myBooksResponse.data 
+          : myBooksResponse.data?.books || myBooksResponse.data?.data || [];
+        console.log(`✅ Loaded ${myBooks.value.length} books via authors/me/books`);
+      } catch (error) {
+        // If /authors/me/books doesn't exist, try /authors/:id/books
+        if (error.response?.status === 404) {
+          try {
+            console.log("Trying authors/:id/books endpoint...");
+            const response = await AuthorServices.getAuthorBooks(authorProfile.value.id);
+            myBooks.value = Array.isArray(response.data) 
+              ? response.data 
+              : response.data?.books || response.data?.data || [];
+            console.log(`✅ Loaded ${myBooks.value.length} books via authors/${authorProfile.value.id}/books`);
+          } catch (error2) {
+            // If that also fails, try fetching all books and filtering by author
+            if (error2.response?.status === 404) {
+              console.warn("Authors/:id/books endpoint not found, trying fallback method...");
+              
+              try {
+                // Fetch all books and filter by author_id
+                const allBooksResponse = await BookServices.getBooks({});
+                const allBooks = Array.isArray(allBooksResponse.data)
+                  ? allBooksResponse.data
+                  : allBooksResponse.data?.books || allBooksResponse.data?.items || [];
+                
+                console.log(`Fetched ${allBooks.length} total books, filtering by author...`);
+                
+                // Filter books by author_id
+                myBooks.value = allBooks.filter(book => {
+                  // Check if book has this author in its authors array
+                  if (book.authors && Array.isArray(book.authors)) {
+                    const hasAuthor = book.authors.some(author => 
+                      author.id === authorProfile.value.id || 
+                      author.user_id === authorProfile.value.user_id ||
+                      String(author.id) === String(authorProfile.value.id)
+                    );
+                    if (hasAuthor) {
+                      console.log(`Found book "${book.title}" by author match`);
+                    }
+                    return hasAuthor;
+                  }
+                  // Or check if book has author_id field
+                  const matches = book.author_id === authorProfile.value.id || 
+                                 book.author_id === authorProfile.value.user_id ||
+                                 String(book.author_id) === String(authorProfile.value.id);
+                  if (matches) {
+                    console.log(`Found book "${book.title}" by author_id match`);
+                  }
+                  return matches;
+                });
+                
+                console.log(`✅ Loaded ${myBooks.value.length} books via fallback method`);
+              } catch (fallbackError) {
+                console.error("Fallback method also failed:", fallbackError);
+                throw error2; // Throw original error
+              }
+            } else {
+              throw error2;
+            }
+          }
+        } else {
+          throw error;
+        }
+      }
+    } else {
+      // If no author profile, can't load books
+      console.log("No author profile found, cannot load books");
+      myBooks.value = [];
+    }
   } catch (error) {
     console.error("Error loading books:", error);
+    console.error("Full error details:", {
+      message: error.message,
+      response: error.response?.data,
+      status: error.response?.status,
+      url: error.config?.url,
+    });
+    // If 404, author might not have books yet - don't show error
+    if (error.response?.status !== 404) {
+      showSnackbar(error.response?.data?.message || "Failed to load your books", "error");
+    }
     myBooks.value = [];
   }
 }
@@ -103,15 +240,114 @@ async function loadReviews() {
   }
 }
 
+async function createProfile() {
+  try {
+    const userName = currentUser.value?.firstName || 
+                     currentUser.value?.first_name || 
+                     currentUser.value?.name || 
+                     currentUser.value?.user?.first_name || 
+                     "";
+    
+    if (!userName) {
+      showSnackbar("Unable to get user name. Please try logging in again.", "error");
+      return;
+    }
+
+    const response = await AuthorServices.requestAuthorProfile({
+      name: userName,
+      bio: profileForm.value.bio || null,
+      website: profileForm.value.website || null,
+    });
+    
+    console.log("Author profile created:", response.data);
+    authorProfile.value = response.data;
+    profileNotFound.value = false;
+    
+    // Show appropriate message based on status
+    if (response.data?.status === 'approved') {
+      showSnackbar("Author profile created and approved! You can now add books.", "success");
+    } else {
+      showSnackbar("Author profile created successfully! Waiting for admin approval before you can add books.", "success");
+    }
+    
+    showCreateProfile.value = false;
+    // Reload profile to get the newly created one
+    await loadAuthorProfile();
+    // Also reload books in case profile was just approved
+    await loadMyBooks();
+  } catch (error) {
+    console.error("Error creating profile:", error);
+    const errorMsg = error.response?.data?.message || "Failed to create author profile";
+    
+    // If user already has a profile, try to reload it
+    if (errorMsg.toLowerCase().includes('already have') || errorMsg.toLowerCase().includes('already exists')) {
+      showSnackbar("You already have an author profile. Loading it now...", "info");
+      await loadAuthorProfile();
+    } else {
+      showSnackbar(errorMsg, "error");
+    }
+  }
+}
+
 async function updateProfile() {
   try {
-    await AuthorServices.updateAuthorProfile(authorProfile.value.id, profileForm.value);
+    // Check if authorProfile exists and has an id
+    if (!authorProfile.value || !authorProfile.value.id) {
+      showSnackbar("Author profile not found. Please create one first.", "error");
+      showEditProfile.value = false;
+      
+      // Try to reload profile in case it exists but wasn't loaded
+      await loadAuthorProfile();
+      
+      // Check again after reload
+      if (!authorProfile.value || !authorProfile.value.id) {
+        return;
+      }
+    }
+    
+    const authorId = authorProfile.value.id;
+    
+    // Prepare update data - only send fields that can be updated
+    const updateData = {
+      bio: profileForm.value.bio || null,
+      website: profileForm.value.website || null,
+    };
+    
+    // Only include social_links if it's an object
+    if (profileForm.value.social_links && typeof profileForm.value.social_links === 'object') {
+      updateData.social_links = profileForm.value.social_links;
+    }
+    
+    await AuthorServices.updateAuthorProfile(authorId, updateData);
     showSnackbar("Profile updated successfully", "success");
     showEditProfile.value = false;
     await loadAuthorProfile();
   } catch (error) {
     console.error("Error updating profile:", error);
-    showSnackbar(error.response?.data?.message || "Failed to update profile", "error");
+    console.error("Author profile state:", authorProfile.value);
+    const errorMsg = error.response?.data?.message || error.message || "Failed to update profile";
+    showSnackbar(errorMsg, "error");
+    
+    // If it's a 403 or 404, reload the profile in case it changed
+    if (error.response?.status === 403 || error.response?.status === 404) {
+      await loadAuthorProfile();
+    }
+  }
+}
+
+async function deleteBook(bookId) {
+  if (!confirm("Are you sure you want to delete this book? This action cannot be undone.")) {
+    return;
+  }
+
+  try {
+    await BookServices.deleteBook(bookId);
+    showSnackbar("Book deleted successfully", "success");
+    await loadMyBooks();
+  } catch (error) {
+    console.error("Error deleting book:", error);
+    const errorMsg = error.response?.data?.message || "Failed to delete book";
+    showSnackbar(errorMsg, "error");
   }
 }
 
@@ -183,6 +419,20 @@ function openEditBook(book) {
 
 async function saveBook() {
   try {
+    // Check if user has an approved author profile before allowing book creation
+    if (!authorProfile.value || !authorProfile.value.id) {
+      showSnackbar("Please create your author profile first before adding books.", "error");
+      showCreateProfile.value = true;
+      showEditBook.value = false; // Close book dialog
+      return;
+    }
+
+    if (authorProfile.value.status !== 'approved') {
+      showSnackbar("Your author profile must be approved before you can create books. Please wait for admin approval.", "error");
+      showEditBook.value = false; // Close book dialog
+      return;
+    }
+
     // Process genres - convert string to array if needed
     let genres = bookForm.value.genres;
     if (typeof genres === 'string' && genres.trim()) {
@@ -233,12 +483,40 @@ async function saveBook() {
     await loadMyBooks();
   } catch (error) {
     console.error("Error saving book:", error);
-    showSnackbar(error.response?.data?.message || "Failed to save book", "error");
+    const errorMsg = error.response?.data?.message || error.message || "Failed to save book";
+    
+    // If 403 error about needing approved author profile, show helpful message
+    if (error.response?.status === 403 && (errorMsg.toLowerCase().includes('approved author profile') || errorMsg.toLowerCase().includes('author profile'))) {
+      showSnackbar("You need an approved author profile to create books. Please create your profile and wait for admin approval.", "error");
+      // Reload profile to check current status
+      await loadAuthorProfile();
+      // If no profile exists, show create dialog
+      if (!authorProfile.value || !authorProfile.value.id) {
+        showCreateProfile.value = true;
+      }
+      showEditBook.value = false; // Close book dialog
+    } else {
+      showSnackbar(errorMsg, "error");
+    }
   }
 }
 
 function showSnackbar(text, color) {
   snackbar.value = { show: true, text, color };
+}
+
+function openEditProfile() {
+  // Ensure profile is loaded before opening edit dialog
+  if (!authorProfile.value || !authorProfile.value.id) {
+    showSnackbar("Author profile not loaded. Please wait...", "warning");
+    loadAuthorProfile().then(() => {
+      if (authorProfile.value && authorProfile.value.id) {
+        showEditProfile.value = true;
+      }
+    });
+    return;
+  }
+  showEditProfile.value = true;
 }
 </script>
 
@@ -255,9 +533,25 @@ function showSnackbar(text, color) {
       <v-card class="mb-6">
         <v-card-title class="d-flex justify-space-between align-center">
           <span>Author Profile</span>
-          <v-btn color="primary" variant="text" @click="showEditProfile = true">
+          <v-btn 
+            v-if="authorProfile && authorProfile.id" 
+            color="primary" 
+            variant="text" 
+            @click="openEditProfile"
+            :disabled="loading"
+          >
             <v-icon start>mdi-pencil</v-icon>
-            Edit
+            Edit Profile
+          </v-btn>
+          <v-btn 
+            v-else 
+            color="primary" 
+            variant="flat" 
+            @click="showCreateProfile = true"
+            :disabled="loading"
+          >
+            <v-icon start>mdi-account-plus</v-icon>
+            Create Author Profile
           </v-btn>
         </v-card-title>
         <v-card-text v-if="authorProfile">
@@ -279,18 +573,57 @@ function showSnackbar(text, color) {
             <a :href="authorProfile.website" target="_blank">{{ authorProfile.website }}</a>
           </div>
         </v-card-text>
+        <v-card-text v-else>
+          <div class="text-center py-4">
+            <v-icon size="64" color="grey-lighten-1" class="mb-4">mdi-account-circle</v-icon>
+            <p class="text-h6 mb-2">No Author Profile Yet</p>
+            <p class="text-body-2 text-grey mb-4">
+              Create your author profile to start adding books and managing your publications.
+            </p>
+            <v-btn color="primary" variant="flat" @click="showCreateProfile = true">
+              <v-icon start>mdi-account-plus</v-icon>
+              Create Author Profile
+            </v-btn>
+          </div>
+        </v-card-text>
       </v-card>
 
       <!-- My Books -->
       <v-card class="mb-6">
         <v-card-title class="d-flex justify-space-between align-center">
           <span>My Books ({{ myBooks.length }})</span>
-          <v-btn color="primary" variant="flat" @click="openEditBook(null)">
+          <v-btn 
+            color="primary" 
+            variant="flat" 
+            @click="openEditBook(null)"
+            :disabled="!authorProfile || !authorProfile.id || authorProfile.status !== 'approved'"
+          >
             <v-icon start>mdi-plus</v-icon>
             Add Book
           </v-btn>
+          <v-tooltip v-if="authorProfile && authorProfile.status !== 'approved'" activator="parent">
+            You must have an approved author profile to create books!
+          </v-tooltip>
         </v-card-title>
-        <v-card-text>
+        <v-card-text v-if="!authorProfile || !authorProfile.id" class="text-center py-4">
+          <p class="text-body-2 text-grey mb-2">
+            Please create your author profile first before adding books.
+          </p>
+          <v-btn color="primary" variant="outlined" @click="showCreateProfile = true">
+            Create Author Profile
+          </v-btn>
+        </v-card-text>
+        <v-card-text v-else-if="authorProfile.status !== 'approved'" class="text-center py-4">
+          <v-alert type="warning" variant="tonal" class="mb-4">
+            <v-alert-title>Profile Pending Approval</v-alert-title>
+            Your author profile is currently <strong>{{ authorProfile.status }}</strong>. 
+            You'll be able to add books once your profile is approved by an administrator.
+          </v-alert>
+          <v-btn color="primary" variant="outlined" @click="showEditProfile = true">
+            Update Profile
+          </v-btn>
+        </v-card-text>
+        <v-card-text v-else>
           <v-table v-if="myBooks.length > 0">
             <thead>
               <tr>
@@ -320,21 +653,35 @@ function showSnackbar(text, color) {
                 </td>
                 <td>{{ book.rating_count || 0 }}</td>
                 <td>
-                  <v-btn
-                    icon
-                    size="small"
-                    @click="openEditBook(book)"
-                  >
-                    <v-icon>mdi-pencil</v-icon>
-                  </v-btn>
-                  <v-btn
-                    icon
-                    size="small"
-                    color="primary"
-                    :to="{ name: 'bookDetail', params: { id: book.id } }"
-                  >
-                    <v-icon>mdi-eye</v-icon>
-                  </v-btn>
+                  <div class="d-flex align-center" style="gap: 4px">
+                    <v-btn
+                      icon
+                      size="small"
+                      color="primary"
+                      @click="openEditBook(book)"
+                      title="Edit Book"
+                    >
+                      <v-icon>mdi-pencil</v-icon>
+                    </v-btn>
+                    <v-btn
+                      icon
+                      size="small"
+                      color="error"
+                      @click="deleteBook(book.id)"
+                      title="Delete Book"
+                    >
+                      <v-icon>mdi-delete</v-icon>
+                    </v-btn>
+                    <v-btn
+                      icon
+                      size="small"
+                      color="info"
+                      :to="{ name: 'bookDetail', params: { id: book.id } }"
+                      title="View Book"
+                    >
+                      <v-icon>mdi-eye</v-icon>
+                    </v-btn>
+                  </div>
                 </td>
               </tr>
             </tbody>
@@ -373,6 +720,38 @@ function showSnackbar(text, color) {
           </div>
         </v-card-text>
       </v-card>
+
+      <!-- Create Profile Dialog -->
+      <v-dialog v-model="showCreateProfile" max-width="600">
+        <v-card>
+          <v-card-title>Create Author Profile</v-card-title>
+          <v-card-text>
+            <div class="mb-4">
+              <strong>Name:</strong> {{ currentUser?.firstName || currentUser?.first_name || currentUser?.name || "N/A" }}
+            </div>
+            <v-textarea
+              v-model="profileForm.bio"
+              label="Bio"
+              rows="4"
+              class="mb-4"
+              hint="Tell readers about yourself and your writing"
+              persistent-hint
+            ></v-textarea>
+            <v-text-field
+              v-model="profileForm.website"
+              label="Website URL (optional)"
+              class="mb-4"
+              hint="Your personal website or author page"
+              persistent-hint
+            ></v-text-field>
+          </v-card-text>
+          <v-card-actions>
+            <v-spacer></v-spacer>
+            <v-btn variant="text" @click="showCreateProfile = false">Cancel</v-btn>
+            <v-btn color="primary" variant="flat" @click="createProfile">Create Profile</v-btn>
+          </v-card-actions>
+        </v-card>
+      </v-dialog>
 
       <!-- Edit Profile Dialog -->
       <v-dialog v-model="showEditProfile" max-width="600">
